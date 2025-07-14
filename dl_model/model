@@ -1,0 +1,93 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision.models import resnet18, ResNet18_Weights
+
+class UpBlock(nn.Module):
+    def __init__(self, in_ch, skip_ch, out_ch):
+        super().__init__()
+        self.up     = nn.ConvTranspose2d(in_ch, in_ch // 2, 2, stride=2)
+        self.conv   = nn.Sequential(
+            nn.Conv2d(in_ch // 2 + skip_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x, skip):
+        x = self.up(x)
+        if x.shape[-2:] != skip.shape[-2:]:
+            x = F.interpolate(x, size=skip.shape[-2:], mode='bilinear', align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
+
+
+class ResNetUNet48(nn.Module):
+    """
+    U-Net with a ResNet-18 encoder, tuned for 48×48 inputs.
+    •   Keeps only layers 0-3 of ResNet (output stride 8 -> 6×6 bottleneck)
+    •   Accepts arbitrary in_channels (default 13)
+    """
+    def __init__(self,
+                 in_channels: int = 13,
+                 num_classes: int = 8,
+                 pretrained: bool = True):
+        super().__init__()
+
+        if pretrained:
+            backbone = resnet18(weights=ResNet18_Weights.IMAGENET1K_V1)
+        else:
+            backbone = resnet18(weights=None)
+
+        # patch first conv to in_channels
+        if in_channels != 3:
+          orig_w = backbone.conv1.weight
+          backbone.conv1 = nn.Conv2d(
+              in_channels,
+              orig_w.shape[0],
+              kernel_size=7,
+              stride=1,       
+              padding=3,
+              bias=False
+          )
+
+          if pretrained:
+              with torch.no_grad():
+                  new_w = torch.zeros_like(backbone.conv1.weight)
+
+                  # copy RGB filters
+                  new_w[:, :3] = orig_w
+                  if in_channels > 3:
+                      mean_rgb = orig_w.mean(dim=1, keepdim=True)
+                      new_w[:, 3:] = mean_rgb.repeat(1, in_channels-3, 1, 1)
+
+                  backbone.conv1.weight.copy_(new_w)
+
+        self.enc0 = nn.Sequential(
+            backbone.conv1, backbone.bn1, backbone.relu
+        )                          
+
+        self.enc1 = backbone.layer1
+        self.enc2 = backbone.layer2
+        self.enc3 = backbone.layer3
+
+        ch0, ch1, ch2, ch3 = 64, 64, 128, 256
+
+        self.up2 = UpBlock(ch3, ch2, 128)
+        self.up1 = UpBlock(128, ch1,  96)
+        self.up0 = UpBlock(96,  ch0,  64)
+        self.head = nn.Conv2d(64, num_classes, kernel_size=1)
+
+    def forward(self, x):
+        c0 = self.enc0(x)
+        c1 = self.enc1(c0)
+        c2 = self.enc2(c1)
+        c3 = self.enc3(c2)  #  6 × 6  (bottleneck)
+
+        x  = self.up2(c3, c2)
+        x  = self.up1(x,  c1)
+        x  = self.up0(x,  c0)
+
+        return self.head(x)
