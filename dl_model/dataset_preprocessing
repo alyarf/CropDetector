@@ -1,0 +1,485 @@
+import os
+import random
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from collections import Counter, defaultdict
+import albumentations as A
+from rasterio import open as rio_open
+import torch
+import numpy as np
+import albumentations as A
+from copy import deepcopy
+import cv2
+from datetime import datetime
+from tqdm import tqdm
+
+
+original2new={
+            0: 0,  # Keep unknown as 0
+            1: 0,
+            2: 0,
+            3: 1,  # meadow
+            5: 2,  # rape
+            8: 0,
+            9: 0,
+            12: 0,
+            13: 0,
+            15: 0,
+            16: 3, # potato
+            17: 0,
+            19: 0,
+            22: 4, # winter wheat
+            23: 5, # winter barley
+            24: 0,
+            25: 6, # summer barley
+            26: 7  # maize
+        }
+
+# Build a lookup table (LUT)
+lut = np.full(max(original2new) + 1, -1, dtype=np.int16)
+for k, v in original2new.items():
+    lut[k] = v
+
+
+class ClassAwareSpatioAugmentation:
+    def __init__(self, base_transform, strong_transform, rare_class_ids):
+        self.base_transform = base_transform
+        self.strong_transform = strong_transform
+        self.rare_class_ids = set(rare_class_ids)
+
+    def __call__(self, spatial_input, label):
+        spatial_np = spatial_input.numpy()
+        label_np = label.numpy().astype(np.int32)
+
+        spatial_hwc = spatial_np.transpose(1, 2, 0)
+
+        contains_rare_class = any(c in self.rare_class_ids for c in np.unique(label_np))
+
+        transform = self.strong_transform if contains_rare_class else self.base_transform
+
+        transformed = transform(image=spatial_hwc, mask=label_np)
+        spatial_aug = transformed["image"].transpose(2, 0, 1)
+        label_aug = transformed["mask"]
+
+        return torch.from_numpy(spatial_aug).float(), torch.from_numpy(label_aug).long()
+
+class BalancedSubsetMunich480(Dataset):
+    def __init__(self, folder_path, split='train_fold0', target_size=48,
+                 max_tiles_per_class=100, min_tiles_per_class=5,
+                 max_unknown_ratio=0.8, min_class_presence=0.1, use_augm=True):
+
+        self.folder_path = folder_path
+        self.split = split
+        self.target_size = target_size
+        self.max_tiles_per_class = max_tiles_per_class
+        self.min_tiles_per_class = min_tiles_per_class
+        self.max_unknown_ratio = max_unknown_ratio
+        self.min_class_presence = min_class_presence
+        self.use_augm = use_augm
+
+        self.target_classes = {
+            0: "unknown",
+            3: "meadow",
+            5: "rape",
+            16: "potato",
+            22: "winter wheat",
+            23: "winter barley",
+            25: "summer barley",
+            26: "maize"
+        }
+
+        # from original ID to new index
+        self.class_id_to_new_idx = {
+            0: 0,  # Keep unknown as 0
+            1: 0,
+            2: 0,
+            3: 1,  # meadow
+            5: 2,  # rape
+            8: 0,
+            9: 0,
+            12: 0,
+            13: 0,
+            15: 0,
+            16: 3, # potato
+            17: 0,
+            19: 0,
+            22: 4, # winter wheat
+            23: 5, # winter barley
+            24: 0,
+            25: 6, # summer barley
+            26: 7  # maize
+        }
+
+        self.class_remap=self.class_id_to_new_idx
+        self._setup_base_dataset()
+        self._create_balanced_subset()
+
+        if self.use_augm:
+          self._setup_augmentations()
+
+    def _setup_base_dataset(self):
+        self.data_dirs = [d for d in os.listdir(self.folder_path) if d.startswith("data")]
+
+        # Load class mappings
+        class_file = os.path.join(self.folder_path, "classes.txt")
+        if not os.path.exists(class_file):
+            raise FileNotFoundError(f"Classes file not found at {class_file}")
+
+        tileids_path = os.path.join(self.folder_path, f"{self.split}.tileids")
+        if not os.path.exists(tileids_path):
+            raise FileNotFoundError(f"TileIDs file not found at {tileids_path}")
+
+        with open(tileids_path) as f:
+            tileids = [line.strip() for line in f if line.strip()]
+
+        # Find valid tiles
+        valid_tiles = {}
+        for tile_id in tileids:
+            valid_tile_years = {}
+            for data_dir in self.data_dirs:
+                tile_path = os.path.join(self.folder_path, data_dir, tile_id)
+                if not os.path.exists(tile_path):
+                    continue
+                label_path = os.path.join(tile_path, "y.tif")
+                if os.path.exists(label_path):
+                    valid_tile_years[data_dir] = tile_path
+            if valid_tile_years:
+                valid_tiles[tile_id] = valid_tile_years
+
+        self.valid_tiles = valid_tiles
+        self.original_tile_ids = list(valid_tiles.keys())
+
+    def _create_balanced_subset(self, target_pixels_per_class=150_000):
+        tile_class_info = []
+        class_to_tiles = defaultdict(list) 
+          
+        for idx, tile_id in enumerate(tqdm(self.original_tile_ids, desc="Analyzing tiles")):
+            valid_years = self.valid_tiles[tile_id]
+            label_year = "data16" if "data16" in valid_years else ("data17" if "data17" in valid_years else None)
+            label_path = os.path.join(valid_years[label_year], "y.tif")
+
+            try:
+                with rio_open(label_path) as src:
+                    label = src.read(1)
+
+                total_pixels = label.size
+                unknown_pixels = np.sum(label == 0)
+                unknown_ratio = unknown_pixels / total_pixels
+
+                if unknown_ratio > self.max_unknown_ratio:
+                    continue
+
+                class_composition = {}
+                for class_id in self.target_classes.keys():
+                    if class_id == 0:
+                        continue
+
+                    pixel_count = np.sum(label == class_id)
+                    ratio = pixel_count / total_pixels
+
+                    if ratio >= self.min_class_presence:
+                        new_idx = self.class_id_to_new_idx[class_id]
+                        class_composition[new_idx] = {
+                            "ratio": ratio,
+                            "count": pixel_count
+                        }
+                        class_to_tiles[new_idx].append((idx, pixel_count))
+
+                if class_composition:
+                    tile_class_info.append({
+                        'tile_idx': idx,
+                        'tile_id': tile_id,
+                        'composition': class_composition,
+                        'unknown_ratio': unknown_ratio
+                    })
+
+            except Exception as e:
+                print(f"Error analyzing {label_path}: {e}")
+
+        print(f"\nFound {len(tile_class_info)} valid tiles after filtering\n")
+
+        self.new_idx_to_name = {
+            new: name for cid, name in self.target_classes.items()
+            for old, new in self.class_id_to_new_idx.items()
+            if cid == old
+        }
+
+        selected_tile_indices = set()
+        self.used_classes = set()
+
+        print("\n--- Selecting pixel-balanced subset ---")
+        for class_idx in range(1, len(self.class_id_to_new_idx)):
+            tiles = sorted(class_to_tiles[class_idx], key=lambda x: x[1], reverse=True)
+            total_pixels = 0
+            selected_for_class = []
+
+            for tile_idx, pixel_count in tiles:
+                if total_pixels >= target_pixels_per_class:
+                    break
+                if tile_idx in selected_tile_indices:
+                    continue
+                total_pixels += pixel_count
+                selected_tile_indices.add(tile_idx)
+                selected_for_class.append((tile_idx, pixel_count))
+
+            self.used_classes.add(class_idx)
+            #class_name = self.new_idx_to_name[class_idx]
+            class_name = self.new_idx_to_name.get(class_idx, f"Unknown_{class_idx}")
+
+            print(f"Class {class_idx:2d} ({class_name:<16}): Selected {len(selected_for_class)} tiles for ~{total_pixels:,} pixels")
+
+        self.tile_indices = list(selected_tile_indices)
+        self.tile_ids = [self.original_tile_ids[idx] for idx in self.tile_indices]
+        print(f"\nFinal balanced subset size: {len(self.tile_ids)} tiles")
+
+        self.num_classes = len(self.class_id_to_new_idx)
+
+        # accumulate pixel counts per remapped class
+        pixel_counts = np.zeros(self.num_classes, dtype=np.int64)
+        for class_idx, tile_list in class_to_tiles.items():
+            # tile_list is [(tile_idx, pixel_count), …]
+            pixel_counts[class_idx] = sum(pix for _, pix in tile_list)
+
+        self.class_pixel_counts = pixel_counts
+    def find_tiles_with_class_presence(self, class_id, min_ratio=0.05):
+            matching_tiles = []
+
+            print(f"\nLooking for tiles where class {class_id} has ≥ {min_ratio*100:.1f}% of pixels...")
+
+            for tile_id in tqdm(self.tile_ids, desc="Scanning tiles"):
+                valid_years = self.valid_tiles[tile_id]
+                label_year = "data16" if "data16" in valid_years else ("data17" if "data17" in valid_years else None)
+                label_path = os.path.join(valid_years[label_year], "y.tif")
+
+                try:
+                    with rio_open(label_path) as src:
+                        label = src.read(1)
+
+                    total_pixels = label.size
+                    class_pixels = np.sum(label == class_id)
+                    class_ratio = class_pixels / total_pixels
+
+                    if class_ratio >= min_ratio:
+                        print(f"Tile {tile_id}: {class_ratio:.2%} class {class_id}")
+                        matching_tiles.append(tile_id)
+
+                except Exception as e:
+                    print(f"Error processing tile {tile_id}: {e}")
+
+            print(f"\nFound {len(matching_tiles)} tiles where class {class_id} ≥ {min_ratio*100:.1f}%")
+            return matching_tiles
+
+    def _setup_augmentations(self):
+      self.rare_class_ids = {1, 2, 3, 5, 6}
+
+      self.base_transform = A.Compose([
+          A.RandomRotate90(p=0.5),
+          A.HorizontalFlip(p=0.5),
+          A.VerticalFlip(p=0.5),
+          A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
+          A.Affine(
+              scale=(0.9, 1.1),
+              translate_percent=(-0.05, 0.05),
+              rotate=(-10, 10),
+              shear=(-5, 5),
+              interpolation=cv2.INTER_LINEAR,
+              border_mode=cv2.BORDER_REFLECT,
+              p=0.6
+          ),
+          A.Lambda(image=lambda x, **kwargs: np.clip(x, 0, 1))
+      ], additional_targets={'mask': 'mask'})
+
+      self.strong_transform = A.Compose([
+          A.RandomRotate90(p=0.9),
+          A.HorizontalFlip(p=0.9),
+          A.VerticalFlip(p=0.9),
+          A.RandomBrightnessContrast(brightness_limit=0.4, contrast_limit=0.4, p=0.6),
+          A.ElasticTransform(
+              alpha=1.0, sigma=50, alpha_affine=20,
+              interpolation=cv2.INTER_LINEAR,
+              border_mode=cv2.BORDER_REFLECT_101,
+              p=0.4
+          ),
+          A.CoarseDropout(
+              max_holes=8, max_height=16, max_width=16,
+              min_holes=1, min_height=8, min_width=8,
+              fill_value=0.5,  # reflectance mid-value
+              p=0.5
+          ),
+          A.Affine(
+              scale=(0.75, 1.25),
+              translate_percent=(-0.1, 0.1),
+              rotate=(-25, 25),
+              shear=(-15, 15),
+              interpolation=cv2.INTER_LINEAR,
+              border_mode=cv2.BORDER_REFLECT_101,
+              p=0.8
+          ),
+          A.Lambda(image=lambda x, **kwargs: np.clip(x, 0, 1))
+      ], additional_targets={'mask': 'mask'})
+
+      self.spatio_aug = ClassAwareSpatioAugmentation(
+          self.base_transform, self.strong_transform, self.rare_class_ids
+      )
+
+    def __len__(self):
+        return len(self.tile_ids)
+
+
+    def __getitem__(self, idx):
+        for _ in range(5):  # Try up to 5 different samples if needed
+            tile_id = self.tile_ids[idx]
+            valid_years = self.valid_tiles.get(tile_id, {})
+            year = "data16" if "data16" in valid_years else ("data17" if "data17" in valid_years else None)
+            if year is None:
+                idx = random.randint(0, len(self.tile_ids) - 1)
+                continue
+
+            tile_dir = os.path.join(self.folder_path, year, tile_id)
+            date = self._get_best_date(tile_dir)
+            if not date:
+                idx = random.randint(0, len(self.tile_ids) - 1)
+                continue
+
+            b10m_path = os.path.join(tile_dir, f"{date}_10m.tif")
+            b20m_path = os.path.join(tile_dir, f"{date}_20m.tif")
+            b60m_path = os.path.join(tile_dir, f"{date}_60m.tif")
+
+            if not (os.path.exists(b10m_path) and os.path.exists(b20m_path) and os.path.exists(b60m_path)):
+                idx = random.randint(0, len(self.tile_ids) - 1)
+                continue
+
+            try:
+                b10m = self._load_image(b10m_path)
+                b20m = self._load_image(b20m_path)
+                b60m = self._load_image(b60m_path)
+
+                b20m = F.interpolate(b20m.unsqueeze(0), size=b10m.shape[-2:], mode='bilinear').squeeze(0)
+                b60m = F.interpolate(b60m.unsqueeze(0), size=b10m.shape[-2:], mode='bilinear').squeeze(0)
+
+                spatial_input = torch.cat([b10m, b20m, b60m], dim=0)
+
+                label_path = os.path.join(tile_dir, "y.tif")
+                label = self._load_label(label_path)
+                if label is None:
+                    idx = random.randint(0, len(self.tile_ids) - 1)
+                    continue
+
+                if 'train' in self.split and self.use_augm:
+                    spatial_input, label = self.spatio_aug(spatial_input, label)
+                return spatial_input, label, tile_id
+
+            except Exception as e:
+                print(f"Error processing sample {tile_id}: {e}")
+                idx = random.randint(0, len(self.tile_ids) - 1)
+
+        raise RuntimeError("Failed to fetch a valid sample after multiple attempts")
+
+
+    def _load_image(self, path, scale=1e-4):
+          with rio_open(path) as src:
+              img = src.read() * scale
+
+          normalized = np.zeros_like(img, dtype=np.float32)
+          for b in range(img.shape[0]):
+              band_min = np.percentile(img[b], 1)
+              band_max = np.percentile(img[b], 99)
+
+              if band_max > band_min:
+                  normalized[b] = (img[b] - band_min) / (band_max - band_min)
+              else:
+                  normalized[b] = img[b] * 1e-4
+
+          return torch.from_numpy(normalized).float()
+
+
+    def _load_label(self, path):
+        try:
+          with rio_open(path) as src:
+              #original_label = src.read(1)
+              lbl = src.read(1)
+
+          remapped = lut[lbl]
+
+          if (remapped == -1).any():
+              bad_raw = np.unique(lbl[remapped == -1])
+              raise ValueError(f"Unknown labels {bad_raw} in {path}")
+
+          if remapped.shape != (self.target_size, self.target_size):
+              remapped = (
+                  torch.from_numpy(remapped)
+                      .unsqueeze(0).unsqueeze(0).float()
+                      .nearest_interp(size=(self.target_size, self.target_size))  # or F.interpolate
+                      .squeeze()
+                      .numpy()
+                      .astype(np.int16)
+              )
+
+          return torch.from_numpy(remapped).long()
+
+        except Exception as e:
+            print(f"Error loading label {path}: {e}")
+            return None
+
+
+    def _get_cloud_ratio(self, b10m):
+        """
+        Estimate cloud cover from B02 (blue) and NDVI (optional).
+        - b10m: torch tensor of shape [4, H, W] where channels 0 = B02 (blue), 3 = B08 (NIR)
+        """
+        blue = b10m[0]  # B02
+        nir = b10m[3]   # B08
+        red = b10m[2]   # B04
+
+        # Normalize values to [0, 1] if needed
+        # already normalized in _load_image()
+
+        ndvi = (nir - red) / (nir + red + 1e-6)
+
+        bright_blue = blue > 0.7    # heuristic threshold
+        low_ndvi = ndvi < 0.2       # vegetation unlikely
+
+        cloud_pixels = (bright_blue & low_ndvi).float()
+        cloud_ratio = cloud_pixels.mean().item()
+
+        return cloud_ratio
+
+    def _get_best_date(self, tile_dir):
+        if not os.path.exists(tile_dir):
+          print(f"Skipping tile — directory not found: {tile_dir}")
+          return None
+
+        try:
+          date_files = [f for f in os.listdir(tile_dir) if f.endswith("_10m.tif")]
+        except Exception as e:
+          print(f"Error reading directory {tile_dir}: {e}")
+          return None
+
+
+        date_ids = list(set(f[:8] for f in date_files))
+        if not date_ids:
+          return None
+
+        best_date = None
+        min_cloud_ratio = float('inf')
+
+        for date in date_ids:
+            b10m_path = os.path.join(tile_dir, f"{date}_10m.tif")
+            if not os.path.exists(b10m_path):
+                continue
+
+            try:
+                b10m = self._load_image(b10m_path)  # already returns tensor [4, H, W]
+
+                cloud_ratio = self._get_cloud_ratio(b10m)
+
+                if cloud_ratio < min_cloud_ratio:
+                    best_date = date
+                    min_cloud_ratio = cloud_ratio
+            except Exception as e:
+                print(f"Error reading {b10m_path}: {e}")
+                continue
+
+        return best_date if best_date is not None else sorted(date_ids)[0]
